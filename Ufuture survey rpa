@@ -1,0 +1,443 @@
+"""
+╔══════════════════════════════════════════════════════════╗
+║        UFuture Entrance Survey RPA — Full Workflow       ║
+║  1. Login  →  2. Navigate  →  3. Fill  →  4. Validate   ║
+╚══════════════════════════════════════════════════════════╝
+
+Usage : python ufuture_survey_rpa.py
+Config: Fill in your .env file before running
+"""
+
+from playwright.sync_api import sync_playwright, Page, TimeoutError as PWTimeout
+from dotenv import load_dotenv
+import os
+import time
+import random
+import logging
+
+# ── Logging setup ────────────────────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s  %(levelname)-8s  %(message)s",
+    datefmt="%H:%M:%S",
+)
+log = logging.getLogger("UFutureRPA")
+
+# ── Load .env ─────────────────────────────────────────────────────────────────
+load_dotenv()
+
+URL      = os.getenv("UFUTURE_URL")       # e.g. https://ufuture.example.edu/login
+USERNAME = os.getenv("UFUTURE_USERNAME")  # Student ID
+PASSWORD = os.getenv("UFUTURE_PASSWORD")  # Password
+
+if not all([URL, USERNAME, PASSWORD]):
+    raise ValueError("❌  Missing credentials! Please fill in your .env file.")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ⚙️  SETTINGS  — Adjust as needed
+# ─────────────────────────────────────────────────────────────────────────────
+
+HEADLESS        = False    # True = silent background, False = watch it run
+DRY_RUN         = False     # True = fills form but SKIPS submit (for testing)
+LIKERT_DEFAULT  = "1"      # Default radio value if RANDOMIZE is False
+RANDOMIZE       = False     # True = random value between LIKERT_MIN & LIKERT_MAX
+LIKERT_MIN      = 4        # Lowest random Likert value
+LIKERT_MAX      = 5        # Highest random Likert value
+PAUSE_BETWEEN   = 1.5      # Seconds to pause between surveys (be polite to server)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 🔍  SELECTORS  — Update these if the site HTML changes
+# ─────────────────────────────────────────────────────────────────────────────
+
+SEL = {
+    # Login page
+    "login_username"    : "input[name='username'], input[type='email'], input[id*='user']",
+    "login_password"    : "input[name='password'], input[type='password']",
+    "login_button"      : "button[type='submit'], input[type='submit']",
+
+    # Sidebar navigation — nested menu: Evaluation > Entrance/Exit Survey
+    "evaluation_menu"   : "a:has-text('Evaluation'), li:has-text('Evaluation') > a, span:has-text('Evaluation')",
+    "survey_nav_link"   : "a:has-text('Entrance/Exit Survey'), a:has-text('Entrance'), a:has-text('Exit Survey')",
+
+    # Survey table
+    "survey_table_rows" : "table tr",
+    "status_cell"       : "td:has-text('Not Taken Yet')",
+    "answer_button"     : "td:has-text('Not Taken Yet') ~ td a, "
+                          "td:has-text('Not Taken Yet') ~ td button, "
+                          "a:has-text('Click to Answer'), button:has-text('Click to Answer')",
+
+    # Inside survey form
+    "radio_buttons"     : "input[type='radio']",
+    "submit_button"     : "button[type='submit'], "
+                          "button:has-text('Submit'), "
+                          "button:has-text('Save'), "
+                          "input[type='submit'], "
+                          "button:has-text('Finish'), "
+                          "button:has-text('Complete')",
+
+    # After submit — completed status
+    "completed_status"  : "td:has-text('COMPLETED'), span:has-text('COMPLETED'), "
+                          ".label-success:has-text('COMPLETED')",
+
+    # Logout
+    "logout_link"       : "a:has-text('Logout'), a:has-text('Log Out'), a:has-text('Sign Out')",
+    
+    # Success message after submission
+    "success_message"   : ".alert-success, .success-message, div:has-text('successfully'), div:has-text('completed')",
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 🛠️  HELPERS
+# ─────────────────────────────────────────────────────────────────────────────
+
+def pick_likert_value() -> str:
+    """Return the Likert value to select based on settings."""
+    if RANDOMIZE:
+        return str(random.randint(LIKERT_MIN, LIKERT_MAX))
+    return LIKERT_DEFAULT
+
+def fill_radio_buttons(page: Page, survey_name: str = "survey") -> int:
+    """
+    Finds all radio button groups on the page and selects the
+    chosen Likert value for each group.
+    Returns the number of questions answered.
+    """
+    answered = 0
+    # Get all unique radio group names
+    radio_names = page.eval_on_selector_all(
+        SEL["radio_buttons"],
+        "radios => [...new Set(radios.map(r => r.name))].filter(Boolean)"
+    )
+
+    if not radio_names:
+        # Fallback: click radio buttons by value directly
+        value = pick_likert_value()
+        radios = page.locator(f"input[type='radio'][value='{value}']")
+        count  = radios.count()
+        for i in range(count):
+            try:
+                radios.nth(i).click(force=True)
+                answered += 1
+            except Exception:
+                pass
+        log.info(f"  📝  Answered {answered} questions with value={value} (fallback mode)")
+        return answered
+
+    for name in radio_names:
+        value = pick_likert_value()
+        try:
+            radio = page.locator(f"input[type='radio'][name='{name}'][value='{value}']")
+            if radio.count() > 0:
+                radio.first.click(force=True)
+                answered += 1
+            else:
+                # If exact value missing, pick the last available option
+                all_radios = page.locator(f"input[type='radio'][name='{name}']")
+                all_radios.last.click(force=True)
+                answered += 1
+        except Exception as e:
+            log.warning(f"  ⚠️  Could not select radio [{name}={value}]: {e}")
+
+    log.info(f"  📝  Answered {answered} questions in '{survey_name[:50]}...'")
+    return answered
+
+def navigate_to_survey_list(page: Page, refresh: bool = True):
+    """
+    Navigate back to the survey list page and refresh the view
+    """
+    log.info("↩️   Returning to survey list...")
+    
+    # Check if we're already on the survey list page
+    current_url = page.url
+    if "entrance" in current_url.lower() or "exit" in current_url.lower() or "survey" in current_url.lower():
+        if page.locator(SEL["status_cell"]).count() > 0:
+            log.info("Already on survey list page, refreshing...")
+            if refresh:
+                page.reload()
+                page.wait_for_load_state("networkidle")
+                time.sleep(2)
+            return True
+    
+    # Try to click the survey navigation link (with wait for visibility)
+    try:
+        # First, make sure the Evaluation menu is expanded
+        try:
+            eval_menu = page.locator(SEL["evaluation_menu"]).first
+            if eval_menu.is_visible():
+                # Check if submenu is visible
+                survey_link = page.locator(SEL["survey_nav_link"]).first
+                if not survey_link.is_visible():
+                    log.info("Expanding Evaluation menu...")
+                    eval_menu.click()
+                    time.sleep(1)
+        except:
+            pass
+        
+        # Now click the survey link
+        survey_link = page.locator(SEL["survey_nav_link"]).first
+        survey_link.wait_for(state="visible", timeout=5000)
+        survey_link.click()
+        page.wait_for_load_state("networkidle")
+        time.sleep(2)
+        log.info("Successfully navigated to survey list")
+        return True
+    except Exception as e:
+        log.debug(f"Could not click survey link: {e}")
+    
+    # Fallback: use direct URL navigation if available
+    try:
+        # Try to find the survey list URL from current page
+        if "/ess/" in current_url:
+            base_url = "/".join(current_url.split("/")[:4])  # Adjust based on your URL structure
+            page.goto(base_url + "/dashboard/home")  # Common survey dashboard URL
+            page.wait_for_load_state("networkidle")
+            time.sleep(2)
+            return True
+    except:
+        pass
+    
+    log.warning("Could not navigate to survey list")
+    return False
+
+def find_and_click_submit(page: Page) -> bool:
+    """
+    Tries multiple strategies to find and click the submit button.
+    Returns True if successful, False otherwise.
+    """
+    # Strategy 1: Try the predefined selectors
+    for selector in SEL["submit_button"].split(", "):
+        try:
+            submit_btn = page.locator(selector)
+            if submit_btn.count() > 0 and submit_btn.first.is_visible():
+                log.info(f"  🔘 Found submit button with selector: {selector}")
+                submit_btn.first.click()
+                return True
+        except Exception:
+            continue
+    
+    # Strategy 2: Look for any button that might be a submit button
+    try:
+        # Look for buttons with common submit text
+        submit_texts = ['submit', 'save', 'finish', 'complete', 'send', 'ok', 'done']
+        for text in submit_texts:
+            btn = page.locator(f"button:has-text('{text}'), input[value*='{text}']")
+            if btn.count() > 0 and btn.first.is_visible():
+                log.info(f"  🔘 Found submit button with text: {text}")
+                btn.first.click()
+                return True
+    except Exception:
+        pass
+    
+    # Strategy 3: Look for the first button in the form
+    try:
+        first_button = page.locator("form button, form input[type='submit']").first
+        if first_button.count() > 0 and first_button.is_visible():
+            log.info("  🔘 Using the first button in the form")
+            first_button.click()
+            return True
+    except Exception:
+        pass
+    
+    log.warning("  ⚠️  Could not find any submit button on the page")
+    return False
+
+def extract_course_name(row_element) -> str:
+    """Extract course name from the survey row"""
+    try:
+        # Try to get the text from the first cell (usually contains course name)
+        cells = row_element.locator("td").all()
+        if len(cells) > 0:
+            course_text = cells[0].inner_text().strip()
+            # Clean up the text
+            course_text = course_text.split('\n')[0].strip()
+            return course_text[:50]  # Limit length
+    except:
+        pass
+    return "Unknown Course"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 🤖  MAIN RPA WORKFLOW
+# ─────────────────────────────────────────────────────────────────────────────
+
+def run():
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=HEADLESS)
+        context = browser.new_context()
+        page    = context.new_page()
+
+        surveys_completed = 0
+
+        try:
+            # ══════════════════════════════════════════════════════════════
+            # STEP 1 — LOGIN
+            # ══════════════════════════════════════════════════════════════
+            log.info("━━━  STEP 1: Login  ━━━")
+            log.info(f"🌐  Opening {URL}")
+            page.goto(URL, timeout=30_000)
+            page.wait_for_load_state("networkidle")
+
+            log.info("🔐  Entering credentials...")
+            page.fill(SEL["login_username"], USERNAME)
+            page.fill(SEL["login_password"], PASSWORD)
+            page.click(SEL["login_button"])
+            page.wait_for_load_state("networkidle")
+            time.sleep(2)
+            log.info("✅  Logged in successfully")
+
+            # ══════════════════════════════════════════════════════════════
+            # STEP 2 — NAVIGATE TO ENTRANCE/EXIT SURVEY
+            # ══════════════════════════════════════════════════════════════
+            log.info("━━━  STEP 2: Navigation  ━━━")
+
+            # Click "Evaluation" to expand the submenu first
+            log.info("🔎  Expanding Evaluation menu...")
+            try:
+                eval_menu = page.locator(SEL["evaluation_menu"]).first
+                if eval_menu.is_visible():
+                    eval_menu.click()
+                    time.sleep(1.5)
+            except Exception as e:
+                log.warning(f"⚠️  Could not click Evaluation menu: {e}")
+
+            # Click "Entrance/Exit Survey"
+            log.info("🔎  Opening Entrance/Exit Survey...")
+            survey_link = page.locator(SEL["survey_nav_link"]).first
+            survey_link.wait_for(state="visible", timeout=10000)
+            survey_link.click()
+            page.wait_for_load_state("networkidle")
+            time.sleep(2)
+            log.info(f"📄  Survey page loaded")
+
+            # ══════════════════════════════════════════════════════════════
+            # STEP 3 — DATA ENTRY LOOP
+            # ══════════════════════════════════════════════════════════════
+            log.info("━━━  STEP 3: Survey Loop  ━━━")
+
+            while True:
+                # Refresh and wait for the survey table to load
+                page.wait_for_load_state("networkidle")
+                time.sleep(1)
+                
+                # Find all pending surveys
+                pending_cells = page.locator(SEL["status_cell"]).all()
+                pending_count = len(pending_cells)
+
+                if pending_count == 0:
+                    log.info("🎉  No more 'Not Taken Yet' surveys found!")
+                    break
+
+                log.info(f"📋  Found {pending_count} pending survey(s). Processing first one...")
+
+                # Get the first pending survey's row and course name
+                first_pending = pending_cells[0]
+                parent_row = first_pending.locator("xpath=ancestor::tr")
+                course_name = extract_course_name(parent_row)
+                
+                log.info(f"➡️   Opening survey: {course_name}")
+
+                # Find and click the answer button in this row
+                try:
+                    # Look for answer button in the same row
+                    answer_btn = parent_row.locator("a:has-text('Answer'), button:has-text('Answer'), a:has-text('Click to Answer')").first
+                    if answer_btn.count() == 0:
+                        # Try more general selector
+                        answer_btn = parent_row.locator("a, button").filter(has_text="Answer").first
+                    
+                    answer_btn.click()
+                    page.wait_for_load_state("networkidle")
+                    time.sleep(2)
+                except Exception as e:
+                    log.warning(f"⚠️  Could not find answer button: {e}")
+                    break
+
+                # Fill in the radio buttons
+                fill_radio_buttons(page, course_name)
+                time.sleep(0.5)
+
+                # Submit the form
+                if DRY_RUN:
+                    log.info("🧪  DRY RUN — skipping submit")
+                    break
+
+                log.info("📤  Submitting survey...")
+                submit_success = find_and_click_submit(page)
+                
+                if submit_success:
+                    # Wait for submission to complete
+                    page.wait_for_load_state("networkidle")
+                    time.sleep(3)
+                    surveys_completed += 1
+                    log.info(f"✅  Survey '{course_name}' submitted! (Total: {surveys_completed})")
+                    
+                    # Wait for any success message
+                    try:
+                        success_msg = page.locator(SEL["success_message"]).first
+                        if success_msg.is_visible(timeout=3000):
+                            log.info("  ✓ Submission confirmed")
+                    except:
+                        pass
+                else:
+                    log.warning(f"⚠️  Could not submit survey '{course_name}'")
+                    # Try to go back
+                    page.go_back()
+                    time.sleep(2)
+                    continue
+                
+                time.sleep(PAUSE_BETWEEN)
+
+                # Navigate back to the survey list and refresh
+                if not navigate_to_survey_list(page, refresh=True):
+                    log.warning("Navigation failed, trying to reload page...")
+                    page.reload()
+                    time.sleep(3)
+                
+                # Small pause before next iteration
+                time.sleep(1)
+
+            # ══════════════════════════════════════════════════════════════
+            # STEP 4 — VALIDATION & LOGOUT
+            # ══════════════════════════════════════════════════════════════
+            log.info("━━━  STEP 4: Validation & Logout  ━━━")
+
+            # Ensure we're on the survey list
+            navigate_to_survey_list(page, refresh=True)
+            
+            # Count completed surveys
+            completed_labels = page.locator(SEL["completed_status"]).count()
+            log.info(f"🔍  Verification: {completed_labels} survey(s) marked as COMPLETED")
+            log.info(f"📊  Total surveys completed in this session: {surveys_completed}")
+
+            # Logout
+            log.info("🚪  Logging out...")
+            try:
+                # Try to find logout link
+                logout_link = page.locator(SEL["logout_link"]).first
+                if logout_link.is_visible():
+                    logout_link.click()
+                    page.wait_for_load_state("networkidle")
+                    log.info("✅  Logged out successfully")
+                else:
+                    # Try to find logout in user menu
+                    user_menu = page.locator("a:has-text('Welcome'), .user-menu, .dropdown-toggle").first
+                    if user_menu.is_visible():
+                        user_menu.click()
+                        time.sleep(1)
+                        logout_link = page.locator("a:has-text('Logout')").first
+                        if logout_link.is_visible():
+                            logout_link.click()
+                            log.info("✅  Logged out successfully")
+            except Exception as e:
+                log.warning(f"⚠️  Could not logout: {e}")
+
+        except Exception as e:
+            log.error(f"💥  Unexpected error: {e}")
+            raise
+
+        finally:
+            browser.close()
+            log.info("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+            log.info(f"🏁  Done! Total surveys completed: {surveys_completed}")
+            log.info("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+
+if __name__ == "__main__":
+    run()
